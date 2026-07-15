@@ -78,6 +78,9 @@ function main()
     est_raw_top, true_raw_top  = 0.0, 0.0   # top-N por média bruta
     est_crd_top, true_crd_top  = 0.0, 0.0   # top-N por credibilidade
     σ̂_acc, τ̂_acc, Z̄_acc = 0.0, 0.0, 0.0
+    κ̂s = Float64[]
+    horizontes = (12, 36, 60, 120)
+    Ẑm_acc = Dict(m => 0.0 for m in horizontes)
 
     for _ in 1:R
         θ, n, X̄, S² = simula_painel(rng)
@@ -94,12 +97,19 @@ function main()
         est_crd_top  += mean(θ̂[top_crd]);  true_crd_top += mean(θ[top_crd])
 
         σ̂_acc += sqrt(σ²); τ̂_acc += sqrt(τ²); Z̄_acc += mean(Z)
+        κ̂ = σ² / τ²   # Inf quando τ̂² trunca em zero
+        push!(κ̂s, κ̂)
+        for m in horizontes
+            Ẑm_acc[m] += m / (m + κ̂)
+        end
     end
 
     mse_ind /= R; mse_col /= R; mse_cred /= R
     est_raw_top /= R; true_raw_top /= R
     est_crd_top /= R; true_crd_top /= R
     σ̂ = σ̂_acc / R; τ̂ = τ̂_acc / R; Z̄ = Z̄_acc / R
+    κ̂_med = median(κ̂s)
+    trunc_pct = 100 * count(isinf, κ̂s) / R
 
     aa(x)  = 12 * 100 * x          # alfa mensal → % a.a.
     vol(x) = sqrt(12) * 100 * x    # vol mensal → % a.a.
@@ -108,9 +118,12 @@ function main()
     println("=== Parâmetros estruturais (verdadeiro vs. estimado, média de $R replicações) ===")
     @printf("σ (vol idiossincrática): %.2f%% a.a. | estimado %.2f%% a.a.\n", vol(σ_TRUE), vol(σ̂))
     @printf("τ (dispersão de alfas):  %.2f%% a.a. | estimado %.2f%% a.a.\n", aa(τ_TRUE), aa(τ̂))
-    @printf("κ = σ²/τ²: %.0f meses | Z médio do painel: %.3f\n", κ_true, Z̄)
-    for m in (12, 36, 60, 120)
-        @printf("  Z(n = %3d meses) = %.3f\n", m, m / (m + κ_true))
+    @printf("κ = σ²/τ²: %.0f meses | mediana estimada %.0f meses | Z médio do painel: %.3f\n",
+            κ_true, κ̂_med, Z̄)
+    @printf("Replicações com τ̂² truncado em zero (Z = 0): %.1f%%\n", trunc_pct)
+    for m in horizontes
+        @printf("  Z(n = %3d meses) = %.3f | estimado %.3f\n",
+                m, m / (m + κ_true), Ẑm_acc[m] / R)
     end
 
     println("\n=== Erro de estimação do alfa (RMSE, % a.a.) ===")
