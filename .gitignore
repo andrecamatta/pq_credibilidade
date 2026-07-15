@@ -1,0 +1,10 @@
+artigos/
+*.png
+*.csv
+*.meta.json
+*.mmd
+Manifest.toml
+payload.json
+response.json
+*_tabela*.html
+scratch/
