@@ -1,143 +1,326 @@
 # credibilidade.jl
-# Estimador de Bühlmann-Straub aplicado a um painel de fundos com históricos desiguais.
-# Compara três estimadores do alfa mensal de cada fundo:
-#   (1) média amostral individual;
-#   (2) média do coletivo;
-#   (3) prêmio de credibilidade Z·X̄ᵢ + (1−Z)·μ̂.
-# Avalia erro quadrático contra o alfa verdadeiro via Monte Carlo e mede a
-# maldição do vencedor na seleção dos melhores fundos por média bruta.
 #
+# Bühlmann-Straub em dados reais de fundos brasileiros. O script baixa os
+# Informes Diários e o cadastro oficial da CVM, forma retornos mensais de fundos
+# Ações Livre e avalia três previsores em janelas fora da amostra:
+#   (1) média histórica individual;
+#   (2) média do coletivo;
+#   (3) prêmio de credibilidade Z·X̄ᵢ + (1-Z)·μ̂.
+#
+# Os dados brutos ficam em cache local e não são versionados.
 # Reproduzir: julia --project=. credibilidade.jl
 
-using Random, Statistics, Distributions, Printf
+using Downloads, Printf, Statistics, ZipFile
 
-# ---------------------------------------------------------------------------
-# Parâmetros do universo simulado (escala mensal)
-# ---------------------------------------------------------------------------
-const K      = 200        # número de fundos no coletivo
-const μ_TRUE = 0.0        # alfa médio do coletivo
-const τ_TRUE = 0.00125    # desvio-padrão do alfa entre fundos (≈ 1,5% a.a.)
-const σ_TRUE = 0.02       # vol idiossincrática mensal (≈ 6,9% a.a.)
-const N_MIN, N_MAX = 12, 120   # históricos entre 1 e 10 anos
-const R      = 500        # replicações Monte Carlo
-const TOP    = 20         # tamanho da carteira "melhores fundos"
+const CVM_INF_URL = "https://dados.cvm.gov.br/dados/FI/DOC/INF_DIARIO/DADOS"
+const CVM_CAD_URL = "https://dados.cvm.gov.br/dados/FI/CAD/DADOS/cad_fi.csv"
+const DATA_DIR = get(ENV, "PQ_CVM_DATA", joinpath(@__DIR__, "data", "cvm"))
+const FIRST_MONTH = 202101
+const LAST_MONTH = 202412
+const MIN_TRAIN = 12
+const RETURN_FLOOR = -0.50
+const RETURN_CEILING = 1.00
 
-"""
-    buhlmann_straub(X̄, S², n)
-
-Estimadores não-paramétricos de Bühlmann-Straub com pesos unitários por mês.
-Recebe médias individuais `X̄`, variâncias amostrais `S²` e tamanhos `n`;
-devolve (μ̂, σ̂², τ̂², Z), onde Z é o vetor de fatores de credibilidade.
-"""
-function buhlmann_straub(X̄::Vector{Float64}, S²::Vector{Float64}, n::Vector{Int})
-    Kf = length(X̄)
-    N  = sum(n)
-    # variância intra (within): média ponderada das variâncias amostrais
-    σ² = sum((n .- 1) .* S²) / sum(n .- 1)
-    # variância entre (between): estimador de Bühlmann-Straub, truncado em zero
-    X̄w = sum(n .* X̄) / N
-    q  = sum(n .* (X̄ .- X̄w) .^ 2)
-    τ² = max((q - (Kf - 1) * σ²) / (N - sum(n .^ 2) / N), 0.0)
-    if τ² == 0.0
-        Z = zeros(Kf)
-        return X̄w, σ², τ², Z
-    end
-    κ = σ² / τ²
-    Z = n ./ (n .+ κ)
-    # média do coletivo ponderada por credibilidade (estimador recomendado)
-    μ̂ = sum(Z .* X̄) / sum(Z)
-    return μ̂, σ², τ², Z
+"Converte um campo numérico da CVM, preservando `missing` em campos vazios."
+function cvmfloat(value::AbstractString)
+    isempty(value) && return missing
+    parsed = tryparse(Float64, replace(value, ',' => '.'))
+    return isnothing(parsed) ? missing : parsed
 end
 
-"""
-    simula_painel(rng)
+"Divide uma linha dos arquivos da CVM, cujo separador é ponto e vírgula."
+fields(line::AbstractString) = split(chomp(line), ';'; keepempty = true)
 
-Sorteia alfas verdadeiros θᵢ ~ N(μ, τ²), históricos nᵢ e retornos mensais
-Xᵢₜ ~ N(θᵢ, σ²); devolve (θ, n, X̄, S²).
-"""
-function simula_painel(rng::AbstractRNG)
-    n  = rand(rng, N_MIN:N_MAX, K)
-    θ  = rand(rng, Normal(μ_TRUE, τ_TRUE), K)
-    X̄  = Vector{Float64}(undef, K)
-    S² = Vector{Float64}(undef, K)
-    for i in 1:K
-        x = rand(rng, Normal(θ[i], σ_TRUE), n[i])
-        X̄[i]  = mean(x)
-        S²[i] = var(x)
-    end
-    return θ, n, X̄, S²
+"Avança um inteiro AAAAMM em um mês."
+function nextmonth(yyyymm::Int)
+    year, month = divrem(yyyymm, 100)
+    month == 12 ? 100 * (year + 1) + 1 : yyyymm + 1
 end
 
-# ---------------------------------------------------------------------------
-# Monte Carlo
-# ---------------------------------------------------------------------------
-function main()
-    rng = MersenneTwister(42)
+"Lista inclusivamente os meses entre dois inteiros AAAAMM."
+function monthrange(first::Int, last::Int)
+    months = Int[]
+    current = first
+    while current <= last
+        push!(months, current)
+        current = nextmonth(current)
+    end
+    return months
+end
 
-    mse_ind, mse_col, mse_cred = 0.0, 0.0, 0.0
-    est_raw_top, true_raw_top  = 0.0, 0.0   # top-N por média bruta
-    est_crd_top, true_crd_top  = 0.0, 0.0   # top-N por credibilidade
-    σ̂_acc, τ̂_acc, Z̄_acc = 0.0, 0.0, 0.0
-    κ̂s = Float64[]
-    horizontes = (12, 36, 60, 120)
-    Ẑm_acc = Dict(m => 0.0 for m in horizontes)
+"Baixa um arquivo somente quando ele ainda não existe no cache."
+function cached_download(url::AbstractString, path::AbstractString)
+    isfile(path) && return path
+    mkpath(dirname(path))
+    partial = path * ".part"
+    for attempt in 1:3
+        try
+            @printf("Baixando %s (tentativa %d/3)\n", basename(path), attempt)
+            Downloads.download(url, partial)
+            mv(partial, path; force = true)
+            return path
+        catch error
+            attempt == 3 && rethrow(error)
+            sleep(2.0 * attempt)
+        end
+    end
+    error("Falha inesperada ao baixar $url")
+end
 
-    for _ in 1:R
-        θ, n, X̄, S² = simula_painel(rng)
-        μ̂, σ², τ², Z = buhlmann_straub(X̄, S², n)
-        θ̂ = Z .* X̄ .+ (1 .- Z) .* μ̂
+"Seleciona no cadastro fundos Ações Livre, abertos e não exclusivos."
+function eligible_funds(cad_path::AbstractString)
+    eligible = Set{String}()
+    open(cad_path, "r") do io
+        header = fields(readline(io))
+        index = Dict(name => i for (i, name) in enumerate(header))
+        required = ("CNPJ_FUNDO", "DT_CANCEL", "CLASSE", "CONDOM",
+                    "FUNDO_EXCLUSIVO", "CLASSE_ANBIMA")
+        all(haskey(index, name) for name in required) ||
+            error("Cadastro da CVM sem as colunas esperadas")
 
-        mse_ind  += mean((X̄ .- θ) .^ 2)
-        mse_col  += mean((μ̂ .- θ) .^ 2)
-        mse_cred += mean((θ̂ .- θ) .^ 2)
+        for line in eachline(io)
+            row = fields(line)
+            classe = row[index["CLASSE"]]
+            classe_anbima = row[index["CLASSE_ANBIMA"]]
+            cancelamento = row[index["DT_CANCEL"]]
 
-        top_raw = partialsortperm(X̄, 1:TOP; rev = true)
-        top_crd = partialsortperm(θ̂, 1:TOP; rev = true)
-        est_raw_top  += mean(X̄[top_raw]);  true_raw_top += mean(θ[top_raw])
-        est_crd_top  += mean(θ̂[top_crd]);  true_crd_top += mean(θ[top_crd])
+            # A comparação por prefixo/sufixo evita depender da codificação
+            # Latin-1 dos acentos no arquivo cadastral.
+            is_equity = startswith(classe, "A") && ncodeunits(classe) < 10
+            is_livre = endswith(classe_anbima, "Livre")
+            is_open = row[index["CONDOM"]] == "Aberto"
+            is_nonexclusive = row[index["FUNDO_EXCLUSIVO"]] == "N"
+            live_through_2024 = isempty(cancelamento) || cancelamento > "2024-12-31"
 
-        σ̂_acc += sqrt(σ²); τ̂_acc += sqrt(τ²); Z̄_acc += mean(Z)
-        κ̂ = σ² / τ²   # Inf quando τ̂² trunca em zero
-        push!(κ̂s, κ̂)
-        for m in horizontes
-            Ẑm_acc[m] += m / (m + κ̂)
+            if is_equity && is_livre && is_open && is_nonexclusive && live_through_2024
+                push!(eligible, row[index["CNPJ_FUNDO"]])
+            end
+        end
+    end
+    return eligible
+end
+
+"Lê a última cota válida de cada fundo em um arquivo mensal compactado."
+function month_end_quotes(zip_path::AbstractString, eligible::Set{String})
+    reader = ZipFile.Reader(zip_path)
+    try
+        length(reader.files) == 1 || error("ZIP inesperado: $zip_path")
+        io = reader.files[1]
+        # Ler o membro inteiro evita milhares de pequenas chamadas de leitura
+        # ao descompressor, que são muito lentas em `eachline(::ZipFile.ReadableFile)`.
+        lines = split(read(io, String), '\n'; keepempty = false)
+        header = fields(lines[1])
+        index = Dict(name => i for (i, name) in enumerate(header))
+
+        # A coluna mudou quando os informes foram adaptados à Resolução CVM 175.
+        id_name = haskey(index, "CNPJ_FUNDO") ? "CNPJ_FUNDO" : "CNPJ_FUNDO_CLASSE"
+        for name in (id_name, "DT_COMPTC", "VL_QUOTA")
+            haskey(index, name) || error("Informe da CVM sem a coluna $name")
+        end
+
+        last = Dict{String,Tuple{String,Float64}}()
+        for line in @view lines[2:end]
+            row = fields(line)
+            cnpj = row[index[id_name]]
+            cnpj in eligible || continue
+            quota = cvmfloat(row[index["VL_QUOTA"]])
+            (ismissing(quota) || quota <= 0) && continue
+            date = row[index["DT_COMPTC"]]
+            if !haskey(last, cnpj) || date >= last[cnpj][1]
+                last[cnpj] = (date, quota)
+            end
+        end
+        return Dict(cnpj => value[2] for (cnpj, value) in last)
+    finally
+        close(reader)
+    end
+end
+
+"Baixa os arquivos necessários e monta as cotas de fim de mês."
+function load_quotes()
+    mkpath(DATA_DIR)
+    cad_path = cached_download(CVM_CAD_URL, joinpath(DATA_DIR, "cad_fi.csv"))
+    eligible = eligible_funds(cad_path)
+    quotes = Dict{String,Dict{Int,Float64}}(cnpj => Dict{Int,Float64}()
+                                               for cnpj in eligible)
+
+    for yyyymm in monthrange(FIRST_MONTH, LAST_MONTH)
+        filename = "inf_diario_fi_$(yyyymm).zip"
+        path = cached_download("$CVM_INF_URL/$filename", joinpath(DATA_DIR, filename))
+        for (cnpj, quota) in month_end_quotes(path, eligible)
+            quotes[cnpj][yyyymm] = quota
+        end
+        @printf("Processado %d\n", yyyymm)
+    end
+    filter!(pair -> !isempty(pair.second), quotes)
+    return quotes, length(eligible)
+end
+
+"Calcula retornos mensais e os centraliza pela média transversal do mês."
+function relative_returns(quotes::Dict{String,Dict{Int,Float64}})
+    raw = Dict{String,Dict{Int,Float64}}()
+    excluded = 0
+    for (cnpj, series) in quotes
+        months = sort!(collect(keys(series)))
+        returns = Dict{Int,Float64}()
+        for (previous, current) in zip(months[1:end-1], months[2:end])
+            current == nextmonth(previous) || continue
+            value = series[current] / series[previous] - 1
+            if RETURN_FLOOR <= value <= RETURN_CEILING
+                returns[current] = value
+            else
+                excluded += 1
+            end
+        end
+        raw[cnpj] = returns
+    end
+
+    benchmark = Dict{Int,Float64}()
+    for month in monthrange(nextmonth(FIRST_MONTH), LAST_MONTH)
+        month_values = [series[month] for series in Base.values(raw) if haskey(series, month)]
+        isempty(month_values) || (benchmark[month] = mean(month_values))
+    end
+
+    relative = Dict{String,Dict{Int,Float64}}()
+    for (cnpj, series) in raw
+        relative[cnpj] = Dict(month => value - benchmark[month]
+                              for (month, value) in series)
+    end
+    return relative, excluded
+end
+
+"Estimadores não paramétricos de Bühlmann-Straub com peso unitário por mês."
+function buhlmann_straub(means::Vector{Float64}, variances::Vector{Float64},
+                         exposure::Vector{Int})
+    funds = length(means)
+    total = sum(exposure)
+    sigma2 = sum((exposure .- 1) .* variances) / sum(exposure .- 1)
+    weighted_mean = sum(exposure .* means) / total
+    q = sum(exposure .* (means .- weighted_mean) .^ 2)
+    denominator = total - sum(exposure .^ 2) / total
+    tau2 = max((q - (funds - 1) * sigma2) / denominator, 0.0)
+    if tau2 == 0
+        return weighted_mean, sigma2, tau2, zeros(funds)
+    end
+    kappa = sigma2 / tau2
+    credibility = exposure ./ (exposure .+ kappa)
+    collective_mean = sum(credibility .* means) / sum(credibility)
+    return collective_mean, sigma2, tau2, credibility
+end
+
+struct FoldResult
+    year::Int
+    funds::Int
+    exposure::Vector{Int}
+    sigma2::Float64
+    tau2::Float64
+    kappa::Float64
+    credibility::Vector{Float64}
+    collective_mean::Float64
+    raw::Vector{Float64}
+    shrunk::Vector{Float64}
+    realized::Vector{Float64}
+    top_count::Int
+    raw_top_estimate::Float64
+    raw_top_realized::Float64
+    cred_top_estimate::Float64
+    cred_top_realized::Float64
+end
+
+"Ajusta o modelo antes de um ano e avalia os doze meses seguintes."
+function evaluate_fold(relative::Dict{String,Dict{Int,Float64}}, train_end::Int,
+                       test_start::Int, test_end::Int)
+    ids = String[]
+    training = Vector{Float64}[]
+    testing = Vector{Float64}[]
+    for (cnpj, series) in relative
+        train = [value for (month, value) in series if 202102 <= month <= train_end]
+        test = [value for (month, value) in series if test_start <= month <= test_end]
+        if length(train) >= MIN_TRAIN && length(test) == 12
+            push!(ids, cnpj)
+            push!(training, train)
+            push!(testing, test)
         end
     end
 
-    mse_ind /= R; mse_col /= R; mse_cred /= R
-    est_raw_top /= R; true_raw_top /= R
-    est_crd_top /= R; true_crd_top /= R
-    σ̂ = σ̂_acc / R; τ̂ = τ̂_acc / R; Z̄ = Z̄_acc / R
-    κ̂_med = median(κ̂s)
-    trunc_pct = 100 * count(isinf, κ̂s) / R
+    exposure = length.(training)
+    raw = mean.(training)
+    variances = var.(training)
+    realized = mean.(testing)
+    collective_mean, sigma2, tau2, credibility =
+        buhlmann_straub(raw, variances, exposure)
+    shrunk = credibility .* raw .+ (1 .- credibility) .* collective_mean
 
-    aa(x)  = 12 * 100 * x          # alfa mensal → % a.a.
-    vol(x) = sqrt(12) * 100 * x    # vol mensal → % a.a.
-    κ_true = σ_TRUE^2 / τ_TRUE^2
+    top_count = round(Int, length(ids) * 0.10)
+    top_raw = partialsortperm(raw, 1:top_count; rev = true)
+    top_cred = partialsortperm(shrunk, 1:top_count; rev = true)
+    year = div(test_start, 100)
 
-    println("=== Parâmetros estruturais (verdadeiro vs. estimado, média de $R replicações) ===")
-    @printf("σ (vol idiossincrática): %.2f%% a.a. | estimado %.2f%% a.a.\n", vol(σ_TRUE), vol(σ̂))
-    @printf("τ (dispersão de alfas):  %.2f%% a.a. | estimado %.2f%% a.a.\n", aa(τ_TRUE), aa(τ̂))
-    @printf("κ = σ²/τ²: %.0f meses | mediana estimada %.0f meses | Z médio do painel: %.3f\n",
-            κ_true, κ̂_med, Z̄)
-    @printf("Replicações com τ̂² truncado em zero (Z = 0): %.1f%%\n", trunc_pct)
-    for m in horizontes
-        @printf("  Z(n = %3d meses) = %.3f | estimado %.3f\n",
-                m, m / (m + κ_true), Ẑm_acc[m] / R)
-    end
-
-    println("\n=== Erro de estimação do alfa (RMSE, % a.a.) ===")
-    @printf("Média individual:        %.2f\n", aa(sqrt(mse_ind)))
-    @printf("Média do coletivo:       %.2f\n", aa(sqrt(mse_col)))
-    @printf("Prêmio de credibilidade: %.2f\n", aa(sqrt(mse_cred)))
-    @printf("Redução de MSE vs. individual: %.1f%%\n", 100 * (1 - mse_cred / mse_ind))
-    @printf("Redução de MSE vs. coletivo:   %.1f%%\n", 100 * (1 - mse_cred / mse_col))
-
-    println("\n=== Maldição do vencedor: top $TOP de $K fundos (alfa % a.a.) ===")
-    @printf("Ranking por média bruta:   estimado %+.2f | verdadeiro %+.2f\n",
-            aa(est_raw_top), aa(true_raw_top))
-    @printf("Ranking por credibilidade: estimado %+.2f | verdadeiro %+.2f\n",
-            aa(est_crd_top), aa(true_crd_top))
+    return FoldResult(year, length(ids), exposure, sigma2, tau2,
+                      tau2 == 0 ? Inf : sigma2 / tau2, credibility,
+                      collective_mean, raw, shrunk, realized, top_count,
+                      mean(raw[top_raw]), mean(realized[top_raw]),
+                      mean(shrunk[top_cred]), mean(realized[top_cred]))
 end
 
-main()
+mse(estimate, realized) = mean((estimate .- realized) .^ 2)
+annual_mean(value) = 1200 * value
+annual_vol(value) = 100 * sqrt(12) * value
+annual_rmse(value) = 1200 * sqrt(value)
+
+function print_fold(result::FoldResult)
+    collective = fill(result.collective_mean, result.funds)
+    @printf("\n=== Validação fora da amostra: %d ===\n", result.year)
+    @printf("Fundos: %d | histórico: %d–%d meses | mediana: %.0f\n",
+            result.funds, minimum(result.exposure), maximum(result.exposure),
+            median(result.exposure))
+    @printf("σ: %.2f%% a.a. | τ: %.2f%% a.a. | κ: %.1f meses | Z mediano: %.3f\n",
+            annual_vol(sqrt(result.sigma2)), annual_mean(sqrt(result.tau2)),
+            result.kappa, median(result.credibility))
+    @printf("RMSE anualizado — individual: %.2f | coletivo: %.2f | credibilidade: %.2f\n",
+            annual_rmse(mse(result.raw, result.realized)),
+            annual_rmse(mse(collective, result.realized)),
+            annual_rmse(mse(result.shrunk, result.realized)))
+    @printf("Top %d por média bruta — estimado: %+.2f | realizado: %+.2f\n",
+            result.top_count, annual_mean(result.raw_top_estimate),
+            annual_mean(result.raw_top_realized))
+    @printf("Top %d por credibilidade — estimado: %+.2f | realizado: %+.2f\n",
+            result.top_count, annual_mean(result.cred_top_estimate),
+            annual_mean(result.cred_top_realized))
+end
+
+function main()
+    quotes, eligible = load_quotes()
+    relative, excluded = relative_returns(quotes)
+    @printf("Cadastro elegível: %d fundos | com cotas no período: %d\n",
+            eligible, length(quotes))
+    @printf("Retornos fora do intervalo [%.0f%%, %.0f%%] excluídos: %d\n",
+            100 * RETURN_FLOOR, 100 * RETURN_CEILING, excluded)
+
+    folds = [
+        evaluate_fold(relative, 202212, 202301, 202312),
+        evaluate_fold(relative, 202312, 202401, 202412),
+    ]
+    foreach(print_fold, folds)
+
+    raw_sse = sum(result.funds * mse(result.raw, result.realized) for result in folds)
+    collective_sse = sum(result.funds * mse(fill(result.collective_mean, result.funds),
+                                            result.realized) for result in folds)
+    cred_sse = sum(result.funds * mse(result.shrunk, result.realized) for result in folds)
+    observations = sum(result.funds for result in folds)
+
+    println("\n=== Resultado agregado dos dois testes ===")
+    @printf("Fundos-ano: %d\n", observations)
+    @printf("RMSE anualizado — individual: %.2f | coletivo: %.2f | credibilidade: %.2f\n",
+            annual_rmse(raw_sse / observations),
+            annual_rmse(collective_sse / observations),
+            annual_rmse(cred_sse / observations))
+    @printf("Redução de MSE da credibilidade vs. individual: %.1f%%\n",
+            100 * (1 - cred_sse / raw_sse))
+    @printf("Variação de MSE da credibilidade vs. coletivo: %+.1f%%\n",
+            100 * (cred_sse / collective_sse - 1))
+end
+
+if abspath(PROGRAM_FILE) == @__FILE__
+    main()
+end

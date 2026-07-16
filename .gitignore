@@ -1,4 +1,5 @@
 artigos/
+data/cvm/
 *.png
 *.csv
 *.meta.json
