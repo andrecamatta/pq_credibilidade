@@ -13,10 +13,11 @@
 using Downloads, Printf, Statistics, ZipFile
 
 const CVM_INF_URL = "https://dados.cvm.gov.br/dados/FI/DOC/INF_DIARIO/DADOS"
-const CVM_CAD_URL = "https://dados.cvm.gov.br/dados/FI/CAD/DADOS/cad_fi.csv"
+const CVM_REG_URL = "https://dados.cvm.gov.br/dados/FI/CAD/DADOS/registro_fundo_classe.zip"
 const DATA_DIR = get(ENV, "PQ_CVM_DATA", joinpath(@__DIR__, "data", "cvm"))
 const FIRST_MONTH = 202101
-const LAST_MONTH = 202412
+const LAST_MONTH = 202512
+const SAMPLE_END_DATE = "2025-12-31"
 const MIN_TRAIN = 12
 const RETURN_FLOOR = -0.50
 const RETURN_CEILING = 1.00
@@ -30,6 +31,7 @@ end
 
 "Divide uma linha dos arquivos da CVM, cujo separador é ponto e vírgula."
 fields(line::AbstractString) = split(chomp(line), ';'; keepempty = true)
+normalize_cnpj(value::AbstractString) = filter(isdigit, value)
 
 "Avança um inteiro AAAAMM em um mês."
 function nextmonth(yyyymm::Int)
@@ -67,35 +69,45 @@ function cached_download(url::AbstractString, path::AbstractString)
     error("Falha inesperada ao baixar $url")
 end
 
-"Seleciona no cadastro fundos Ações Livre, abertos e não exclusivos."
-function eligible_funds(cad_path::AbstractString)
+"Seleciona no registro de classes fundos Ações Livre, abertos e não exclusivos."
+function eligible_funds(registry_path::AbstractString)
     eligible = Set{String}()
-    open(cad_path, "r") do io
-        header = fields(readline(io))
+    reader = ZipFile.Reader(registry_path)
+    try
+        matches = filter(file -> file.name == "registro_classe.csv", reader.files)
+        length(matches) == 1 || error("Registro da CVM sem registro_classe.csv")
+        io = matches[1]
+        lines = split(read(io, String), '\n'; keepempty = false)
+        header = fields(lines[1])
         index = Dict(name => i for (i, name) in enumerate(header))
-        required = ("CNPJ_FUNDO", "DT_CANCEL", "CLASSE", "CONDOM",
-                    "FUNDO_EXCLUSIVO", "CLASSE_ANBIMA")
+        required = ("CNPJ_Classe", "Situacao", "Data_Inicio_Situacao",
+                    "Classificacao", "Classificacao_Anbima",
+                    "Forma_Condominio", "Exclusivo")
         all(haskey(index, name) for name in required) ||
-            error("Cadastro da CVM sem as colunas esperadas")
+            error("Registro de classes da CVM sem as colunas esperadas")
 
-        for line in eachline(io)
+        for line in @view lines[2:end]
             row = fields(line)
-            classe = row[index["CLASSE"]]
-            classe_anbima = row[index["CLASSE_ANBIMA"]]
-            cancelamento = row[index["DT_CANCEL"]]
+            classification = row[index["Classificacao"]]
+            anbima = row[index["Classificacao_Anbima"]]
+            situation = row[index["Situacao"]]
+            situation_start = row[index["Data_Inicio_Situacao"]]
 
             # A comparação por prefixo/sufixo evita depender da codificação
             # Latin-1 dos acentos no arquivo cadastral.
-            is_equity = startswith(classe, "A") && ncodeunits(classe) < 10
-            is_livre = endswith(classe_anbima, "Livre")
-            is_open = row[index["CONDOM"]] == "Aberto"
-            is_nonexclusive = row[index["FUNDO_EXCLUSIVO"]] == "N"
-            live_through_2024 = isempty(cancelamento) || cancelamento > "2024-12-31"
+            is_equity = startswith(classification, "A") && ncodeunits(classification) < 10
+            is_livre = endswith(anbima, "Livre")
+            is_open = row[index["Forma_Condominio"]] == "Aberto"
+            is_nonexclusive = row[index["Exclusivo"]] == "N"
+            live_through_sample = situation == "Em Funcionamento Normal" ||
+                                  situation_start > SAMPLE_END_DATE
 
-            if is_equity && is_livre && is_open && is_nonexclusive && live_through_2024
-                push!(eligible, row[index["CNPJ_FUNDO"]])
+            if is_equity && is_livre && is_open && is_nonexclusive && live_through_sample
+                push!(eligible, normalize_cnpj(row[index["CNPJ_Classe"]]))
             end
         end
+    finally
+        close(reader)
     end
     return eligible
 end
@@ -121,7 +133,7 @@ function month_end_quotes(zip_path::AbstractString, eligible::Set{String})
         last = Dict{String,Tuple{String,Float64}}()
         for line in @view lines[2:end]
             row = fields(line)
-            cnpj = row[index[id_name]]
+            cnpj = normalize_cnpj(row[index[id_name]])
             cnpj in eligible || continue
             quota = cvmfloat(row[index["VL_QUOTA"]])
             (ismissing(quota) || quota <= 0) && continue
@@ -139,8 +151,9 @@ end
 "Baixa os arquivos necessários e monta as cotas de fim de mês."
 function load_quotes()
     mkpath(DATA_DIR)
-    cad_path = cached_download(CVM_CAD_URL, joinpath(DATA_DIR, "cad_fi.csv"))
-    eligible = eligible_funds(cad_path)
+    registry_path = cached_download(CVM_REG_URL,
+                                    joinpath(DATA_DIR, "registro_fundo_classe.zip"))
+    eligible = eligible_funds(registry_path)
     quotes = Dict{String,Dict{Int,Float64}}(cnpj => Dict{Int,Float64}()
                                                for cnpj in eligible)
 
@@ -270,10 +283,12 @@ annual_rmse(value) = 1200 * sqrt(value)
 
 function print_fold(result::FoldResult)
     collective = fill(result.collective_mean, result.funds)
+    max_exposure = maximum(result.exposure)
+    at_max = count(==(max_exposure), result.exposure)
     @printf("\n=== Validação fora da amostra: %d ===\n", result.year)
-    @printf("Fundos: %d | histórico: %d–%d meses | mediana: %.0f\n",
+    @printf("Fundos: %d | histórico: %d–%d meses | mediana: %.0f | no teto: %d (%.1f%%)\n",
             result.funds, minimum(result.exposure), maximum(result.exposure),
-            median(result.exposure))
+            median(result.exposure), at_max, 100 * at_max / result.funds)
     @printf("σ: %.2f%% a.a. | τ: %.2f%% a.a. | κ: %.1f meses | Z mediano: %.3f\n",
             annual_vol(sqrt(result.sigma2)), annual_mean(sqrt(result.tau2)),
             result.kappa, median(result.credibility))
@@ -300,6 +315,7 @@ function main()
     folds = [
         evaluate_fold(relative, 202212, 202301, 202312),
         evaluate_fold(relative, 202312, 202401, 202412),
+        evaluate_fold(relative, 202412, 202501, 202512),
     ]
     foreach(print_fold, folds)
 
@@ -309,7 +325,7 @@ function main()
     cred_sse = sum(result.funds * mse(result.shrunk, result.realized) for result in folds)
     observations = sum(result.funds for result in folds)
 
-    println("\n=== Resultado agregado dos dois testes ===")
+    println("\n=== Resultado agregado dos testes ===")
     @printf("Fundos-ano: %d\n", observations)
     @printf("RMSE anualizado — individual: %.2f | coletivo: %.2f | credibilidade: %.2f\n",
             annual_rmse(raw_sse / observations),
